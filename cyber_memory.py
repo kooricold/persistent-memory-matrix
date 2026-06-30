@@ -9,7 +9,7 @@ TOOL_META = {
         "update() edits in place without touching edges. query() uses hybrid scoring (text + importance)."
     ),
     'enabled': True,
-    'version': '6.0.0',
+    'version': '6.1.0',
     'author': 'user',
     'created_at': '2026-06-29T00:00:00.000000'
 }
@@ -19,6 +19,7 @@ def cyber_memory(
     action: str,
     summary: str = "",
     content: str = "",
+    abstract: str = "",
     top_k: int = 5,
     importance: int = 5,
     tags: list = None,
@@ -36,14 +37,19 @@ def cyber_memory(
     part_b: dict = None,
     keeper_id: str = None,
     absorb_id: str = None,
+    content_limit: int = 0,
+    content_offset: int = 0,
 ) -> dict:
     """
-    Self-driving graph memory for LLM agents. v6.0.0
+    Self-driving graph memory for LLM agents. v6.1.0
 
-    TWO-LAYER NODE MODEL:
+    THREE-LAYER NODE MODEL:
     ┌──────────────────────────────────────────────────────────────────────┐
-    │  summary  (80-150 chars)  -- searched by query(), edge previews      │
-    │  content  (unlimited)     -- full detail, ONLY returned by expand()  │
+    │  summary  (80-150 chars)  -- searched by query(), edge previews.     │
+    │  abstract (300-500 chars) -- ALWAYS in expand(), even when content   │
+    │                             is paginated. The 'what is this' layer.  │
+    │  content  (unlimited)     -- full detail. Paginated via              │
+    │                             content_limit / content_offset.          │
     └──────────────────────────────────────────────────────────────────────┘
 
     SELF-DRIVING BEHAVIORS (happen automatically — no user action required):
@@ -63,41 +69,18 @@ def cyber_memory(
     │                                                                      │
     │  query()  → hybrid scoring: 65% text similarity + 35% importance.   │
     │             High-importance nodes surface even with weaker text hit. │
+    │  find_similar() → given a node ID, finds related nodes NOT yet directly      │
+    │                   linked to it. Fire after expand when context feels thin.  │
     └──────────────────────────────────────────────────────────────────────┘
+        part_a:      split -- dict with summary, content, abstract, tags for first part.
+        part_b:      split -- dict with summary, content, abstract, tags for second part.
+        keeper_id:   merge -- node ID to keep (absorbs the other).
+        absorb_id:   merge -- node ID to absorb and delete.
+        content_limit:  expand -- max chars of content to return per call (0 = no limit).
+        content_offset: expand -- starting char for paginated content (default 0).
 
     Actions:
-    - save:   Store node. Auto-deduplicates. Auto-links similar nodes.
-    - update: Edit node in place. Edges untouched.
-    - merge:  Combine keeper + absorb nodes. Union edges + content.
-    - split:  Divide one node into two linked nodes.
-    - query:  Hybrid search (text + importance). Returns summaries + edge previews.
-    - relate: Manual bidirectional labeled edge between two nodes.
-    - expand: Depth-aware load. Inner hops = full content. Leaf = summary only.
-    - list:   All nodes by importance. Summaries only.
-    - stats:  Graph health overview.
-    - delete: Remove node + clean dangling edges.
-
-    Args:
-        action:     save | update | merge | split | query | relate | expand | list | stats | delete
-        summary:    Short searchable description (80-150 chars). Required for save.
-        content:    Full rich detail. Required for save. Only returned by expand.
-        top_k:      Max results for query/list (default 5).
-        importance: 1-10 for save/update (default 5).
-        tags:       List of tags e.g. ['project', 'tech'].
-        memory_id:  Node ID for update/expand/delete/split.
-        filter_tags: Filter list/query to nodes with ALL these tags.
-        source_id:  relate -- source node ID.
-        target_id:  relate -- target node ID.
-        label:      relate -- edge label ('sub-feature-of', 'built-with', 'uses', etc.).
-        hops:       expand -- depth 1-3 (default 1).
-        session_id: Agent session ID for this save.
-        session_name: Short human-readable session label (5-8 words).
-        force:      save -- skip dedup check and create anyway (default False).
-        append:     update -- append content instead of replacing (default False).
-        part_a:     split -- dict with summary, content, tags for first part.
-        part_b:     split -- dict with summary, content, tags for second part.
-        keeper_id:  merge -- node ID to keep (absorbs the other).
-        absorb_id:  merge -- node ID to absorb and delete.
+        save | update | merge | split | query | relate | expand | find_similar | list | stats | delete
 
     Edge label suggestions:
         sub-feature-of, built-with, owned-by, depends-on, member-of,
@@ -244,7 +227,7 @@ def cyber_memory(
         result = {
             "id":         n["id"],
             "summary":    get_summary(n),
-            "content":    get_content(n),
+            "abstract":   n.get("abstract", "").strip(),
             "importance": n["importance"],
             "tags":       n["tags"],
             "timestamp":  n["timestamp"],
@@ -355,6 +338,7 @@ def cyber_memory(
         node = {
             "id":           str(uuid.uuid4())[:8],
             "summary":      summary.strip(),
+            "abstract":     abstract.strip() if abstract else "",
             "content":      content.strip() if content else "",
             "importance":   max(1, min(10, int(importance))),
             "tags":         tags or [],
@@ -409,6 +393,10 @@ def cyber_memory(
                 if content.strip() != node.get("content", ""):
                     node["content"] = content.strip()
                     changed.append("content (replaced)")
+
+        if abstract and abstract.strip() and abstract.strip() != node.get("abstract", ""):
+            node["abstract"] = abstract.strip()
+            changed.append("abstract")
 
         if importance != 5 or "importance" not in node:
             new_imp = max(1, min(10, int(importance)))
@@ -624,7 +612,7 @@ def cyber_memory(
         }
 
     # ═══════════════════════════════════════════════════════
-    # EXPAND -- depth-aware: inner nodes = full, leaf = summary
+    # EXPAND -- depth-aware: inner = abstract + paginated content, leaf = summary
     # ═══════════════════════════════════════════════════════
     elif action == "expand":
         if not memory_id:
@@ -650,13 +638,35 @@ def cyber_memory(
                     visited[tid] = depth + 1
                     queue.append((tid, depth + 1))
 
+        def build_full_node(n):
+            """Build full node view with content pagination and abstract always present."""
+            base = node_as_full(n)
+            raw_content = get_content(n)
+            climit = max(0, int(content_limit))
+            coffset = max(0, int(content_offset))
+            if climit > 0 and len(raw_content) > climit:
+                chunk = raw_content[coffset: coffset + climit]
+                base["content"]           = chunk
+                base["content_truncated"] = True
+                base["content_total"]     = len(raw_content)
+                base["content_offset"]    = coffset
+                base["content_remaining"] = max(0, len(raw_content) - coffset - climit)
+                base["content_hint"]      = (
+                    f"{base['content_remaining']} chars remaining. "
+                    f"Call expand(memory_id='{n['id']}', content_offset={coffset + climit}) for next page."
+                )
+            else:
+                base["content"] = raw_content[coffset:] if coffset else raw_content
+                base["content_truncated"] = False
+            return base
+
         neighborhood = []
         for nid, depth in visited.items():
             n = get_node(nid)
             if not n:
                 continue
             if depth < h:
-                neighborhood.append(node_as_full(n) | {"depth": depth, "loaded": "full"})
+                neighborhood.append(build_full_node(n) | {"depth": depth, "loaded": "full"})
             else:
                 neighborhood.append(node_as_summary(n) | {"depth": depth, "loaded": "summary"})
 
@@ -675,6 +685,57 @@ def cyber_memory(
                 f"{summary_count} leaf node(s) at summary only. "
                 "Call expand(memory_id=<leaf_id>) to load any leaf's full content."
             ) if summary_count else "All nodes loaded at full content.",
+        }
+
+    # ═══════════════════════════════════════════════════════
+    # FIND_SIMILAR -- discover nodes NOT already linked to memory_id
+    # Fire when expand didn't surface enough context.
+    # ═══════════════════════════════════════════════════════
+    elif action == "find_similar":
+        if not memory_id:
+            return {"success": False, "error": "memory_id required"}
+        anchor = get_node(memory_id)
+        if not anchor:
+            return {"success": False, "error": f"'{memory_id}' not found"}
+
+        # Exclude anchor itself and its direct neighbors (already known)
+        known_ids = {memory_id} | {r["target_id"] for r in anchor.get("relations", [])}
+        pool = [n for n in nodes if n["id"] not in known_ids]
+
+        if not pool:
+            return {
+                "success": True,
+                "results": [],
+                "anchor_id": memory_id,
+                "hint": "All nodes are already directly linked to this one. Graph is fully connected from this anchor.",
+            }
+
+        # Use summary + first 400 chars of content for richer matching
+        anchor_text = get_summary(anchor) + " " + get_content(anchor)[:400]
+        corpus = [get_summary(n) for n in pool]
+        sims, mode = get_similarities(anchor_text, corpus)
+
+        FIND_SIM_THRESHOLD = 0.40   # lower than autolink — this is discovery, not certainty
+        scored = sorted(
+            [(s, n) for s, n in zip(sims, pool) if s >= FIND_SIM_THRESHOLD],
+            key=lambda x: x[0],
+            reverse=True,
+        )
+        results = [
+            node_as_summary(n) | {"similarity": round(s, 3)}
+            for s, n in scored[:max(1, int(top_k))]
+        ]
+        return {
+            "success":    True,
+            "anchor_id":  memory_id,
+            "results":    results,
+            "pool_size":  len(pool),
+            "mode":       mode,
+            "threshold":  FIND_SIM_THRESHOLD,
+            "hint": (
+                "These nodes are NOT already linked. If relevant, call relate() or merge(). "
+                "High similarity here may indicate a missing edge or a merge candidate."
+            ) if results else "No similar unlinked nodes found above threshold.",
         }
 
     # ═══════════════════════════════════════════════════════
@@ -720,6 +781,7 @@ def cyber_memory(
         total_edges      = sum(len(n.get("relations", [])) for n in nodes) // 2
         rules            = [n for n in nodes if "scoring-rule" in n.get("tags", [])]
         isolated         = [n for n in nodes if not n.get("relations")]
+        with_abstract    = [n for n in nodes if n.get("abstract", "").strip()]
         by_connections   = sorted(nodes, key=lambda n: len(n.get("relations", [])), reverse=True)
         timestamps       = sorted([n["timestamp"] for n in nodes if n.get("timestamp")])
 
@@ -728,6 +790,7 @@ def cyber_memory(
             "total_edges":      total_edges,
             "scoring_rules":    len(rules),
             "isolated_nodes":   len(isolated),
+            "nodes_with_abstract": len(with_abstract),
             "most_connected":   [
                 {"id": n["id"], "summary": get_summary(n)[:60], "edges": len(n.get("relations", []))}
                 for n in by_connections[:3]
@@ -765,5 +828,5 @@ def cyber_memory(
         return {
             "success": False,
             "error":   f"Unknown action '{action}'",
-            "valid":   ["save", "update", "merge", "split", "query", "relate", "expand", "list", "stats", "delete"],
+            "valid":   ["save", "update", "merge", "split", "query", "relate", "expand", "find_similar", "list", "stats", "delete"],
         }
