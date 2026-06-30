@@ -9,7 +9,7 @@ TOOL_META = {
         "update() edits in place without touching edges. query() uses hybrid scoring (text + importance)."
     ),
     'enabled': True,
-    'version': '6.2.0',
+    'version': '6.2.2',
     'author': 'user',
     'created_at': '2026-06-29T00:00:00.000000'
 }
@@ -41,7 +41,7 @@ def cyber_memory(
     content_offset: int = 0,
 ) -> dict:
     """
-    Self-driving graph memory for LLM agents. v6.2.0
+    Self-driving graph memory for LLM agents. v6.2.2
 
     THREE-LAYER NODE MODEL:
     ┌──────────────────────────────────────────────────────────────────────┐
