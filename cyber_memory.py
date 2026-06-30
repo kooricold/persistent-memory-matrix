@@ -9,7 +9,7 @@ TOOL_META = {
         "update() edits in place without touching edges. query() uses hybrid scoring (text + importance)."
     ),
     'enabled': True,
-    'version': '6.1.0',
+    'version': '6.2.0',
     'author': 'user',
     'created_at': '2026-06-29T00:00:00.000000'
 }
@@ -41,7 +41,7 @@ def cyber_memory(
     content_offset: int = 0,
 ) -> dict:
     """
-    Self-driving graph memory for LLM agents. v6.1.0
+    Self-driving graph memory for LLM agents. v6.2.0
 
     THREE-LAYER NODE MODEL:
     ┌──────────────────────────────────────────────────────────────────────┐
@@ -80,7 +80,7 @@ def cyber_memory(
         content_offset: expand -- starting char for paginated content (default 0).
 
     Actions:
-        save | update | merge | split | query | relate | expand | find_similar | list | stats | delete
+        save | update | merge | split | query | relate | expand | find_similar | list | stats | delete | profile_update | profile_get
 
     Edge label suggestions:
         sub-feature-of, built-with, owned-by, depends-on, member-of,
@@ -824,9 +824,184 @@ def cyber_memory(
             "remaining": len(nodes),
         }
 
+    # ═══════════════════════════════════════════════════════
+    # PROFILE_UPDATE -- patch the [PROFILE_START]..[PROFILE_END] block
+    # inside the agent's own JSON system_prompt. Zero query cost: the
+    # block is baked into the prompt and always present.
+    # summary = preference key, content = preference value
+    # ═══════════════════════════════════════════════════════
+    elif action == "profile_update":
+        if not summary or not content:
+            return {"success": False, "error": "summary (key) and content (value) are required"}
+
+        PROFILE_START = "[PROFILE_START]"
+        PROFILE_END   = "[PROFILE_END]"
+        PROFILE_CAP   = 12
+
+        # Find the agent JSON that contains the profile markers
+        agent_file = None
+        search_roots = [
+            Path.home() / ".code_puppy" / "agents",
+            Path.home() / ".code_puppy",
+        ]
+        for root in search_roots:
+            if not root.exists():
+                continue
+            for f in root.rglob("*.json"):
+                try:
+                    if PROFILE_START in f.read_text(encoding="utf-8"):
+                        agent_file = f
+                        break
+                except Exception:
+                    continue
+            if agent_file:
+                break
+
+        if not agent_file:
+            return {
+                "success": False,
+                "error": "No agent JSON with profile markers found. Run install.py first.",
+            }
+
+        try:
+            with open(agent_file, "r", encoding="utf-8") as f:
+                agent_data = json.load(f)
+        except Exception as e:
+            return {"success": False, "error": f"Could not read agent JSON: {e}"}
+
+        sp = agent_data.get("system_prompt", [])
+        if not isinstance(sp, list):
+            return {"success": False, "error": "system_prompt is not a list"}
+
+        # Find marker indices
+        start_i = next((i for i, ln in enumerate(sp) if PROFILE_START in str(ln)), None)
+        end_i   = next((i for i, ln in enumerate(sp) if PROFILE_END   in str(ln)), None)
+
+        if start_i is None or end_i is None or end_i <= start_i:
+            return {"success": False, "error": "Profile markers not found or malformed"}
+
+        # Extract current items (lines between markers)
+        raw_items = [str(ln) for ln in sp[start_i + 1: end_i]]
+        items = [ln for ln in raw_items if ln.strip() and ln.strip() != "(empty)"]
+
+        # Parse key: value pairs
+        def parse_item(ln):
+            ln = ln.strip().lstrip("- ").strip()
+            if ":" in ln:
+                k, _, v = ln.partition(":")
+                return k.strip().lower(), v.strip()
+            return None, ln
+
+        pref_dict = {}
+        order     = []
+        for ln in items:
+            k, v = parse_item(ln)
+            if k:
+                pref_dict[k] = v
+                if k not in order:
+                    order.append(k)
+
+        # Update or insert
+        key = summary.strip().lower()
+        val = content.strip()
+        existed = key in pref_dict
+        pref_dict[key] = val
+        if not existed:
+            order.append(key)
+
+        # Enforce cap -- drop oldest when over limit
+        dropped = []
+        while len(order) > PROFILE_CAP:
+            old_key = order.pop(0)
+            dropped.append(old_key)
+            if old_key in pref_dict:
+                del pref_dict[old_key]
+
+        # Rebuild lines
+        new_items = [f"  - {k}: {pref_dict[k]}" for k in order if k in pref_dict]
+        sp[start_i + 1: end_i] = new_items if new_items else ["  (empty)"]
+
+        try:
+            with open(agent_file, "w", encoding="utf-8") as f:
+                json.dump(agent_data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            return {"success": False, "error": f"Could not write agent JSON: {e}"}
+
+        return {
+            "success":    True,
+            "action":     "updated" if existed else "added",
+            "key":        key,
+            "value":      val,
+            "profile":    new_items,
+            "item_count": len(new_items),
+            "dropped":    dropped,
+            "agent_file": str(agent_file),
+            "note":       "Profile is baked into the system prompt. Takes effect next session.",
+        }
+
+    # ═══════════════════════════════════════════════════════
+    # PROFILE_GET -- read the current profile block
+    # ═══════════════════════════════════════════════════════
+    elif action == "profile_get":
+        PROFILE_START = "[PROFILE_START]"
+        PROFILE_END   = "[PROFILE_END]"
+
+        agent_file = None
+        search_roots = [
+            Path.home() / ".code_puppy" / "agents",
+            Path.home() / ".code_puppy",
+        ]
+        for root in search_roots:
+            if not root.exists():
+                continue
+            for f in root.rglob("*.json"):
+                try:
+                    if PROFILE_START in f.read_text(encoding="utf-8"):
+                        agent_file = f
+                        break
+                except Exception:
+                    continue
+            if agent_file:
+                break
+
+        if not agent_file:
+            return {"success": False, "error": "No agent JSON with profile markers found."}
+
+        try:
+            with open(agent_file, "r", encoding="utf-8") as f:
+                agent_data = json.load(f)
+        except Exception as e:
+            return {"success": False, "error": f"Could not read agent JSON: {e}"}
+
+        sp      = agent_data.get("system_prompt", [])
+        start_i = next((i for i, ln in enumerate(sp) if PROFILE_START in str(ln)), None)
+        end_i   = next((i for i, ln in enumerate(sp) if PROFILE_END   in str(ln)), None)
+
+        if start_i is None or end_i is None:
+            return {"success": False, "error": "Profile markers not found"}
+
+        raw = [str(ln) for ln in sp[start_i + 1: end_i] if str(ln).strip() and str(ln).strip() != "(empty)"]
+        parsed = {}
+        for ln in raw:
+            k, _, v = ln.strip().lstrip("- ").partition(":")
+            parsed[k.strip().lower()] = v.strip()
+
+        return {
+            "success":    True,
+            "profile":    parsed,
+            "raw_lines":  raw,
+            "item_count": len(parsed),
+            "cap":        12,
+            "agent_file": str(agent_file),
+        }
+
     else:
         return {
             "success": False,
             "error":   f"Unknown action '{action}'",
-            "valid":   ["save", "update", "merge", "split", "query", "relate", "expand", "find_similar", "list", "stats", "delete"],
+            "valid":   [
+                "save", "update", "merge", "split", "query", "relate",
+                "expand", "find_similar", "list", "stats", "delete",
+                "profile_update", "profile_get",
+            ],
         }
