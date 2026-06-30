@@ -22,7 +22,7 @@ from pathlib import Path
 # ─────────────────────────────────────────────────────────────────────────────
 # Memory protocol lines — injected verbatim into system_prompt arrays
 # ─────────────────────────────────────────────────────────────────────────────
-MEMORY_PROTOCOL_LINES = [  # v6.2.0
+MEMORY_PROTOCOL_LINES = [  # v6.2.1
     "## MEMORY PROTOCOL (Persistent Context Layer):",
     "",
     "You maintain a persistent KNOWLEDGE GRAPH across ALL sessions via cyber_memory v6.2.0.",
@@ -129,6 +129,8 @@ MEMORY_PROTOCOL_LINES = [  # v6.2.0
     "  Searches summary fields only. Returns: summary + edge map per node.",
     "  Full content is NOT included. You are reading the index, not the document.",
     "  Cost: ~50-150 tokens per matching node.",
+    "    WAIT for query results before doing ANY filesystem operations.",
+    "      If the result contains a file path, use it directly. No listing needed.",
     "",
     "STEP 2 — DECIDE whether to expand:",
     "  Read the summaries and edge previews.",
@@ -315,6 +317,27 @@ MEMORY_PROTOCOL_LINES = [  # v6.2.0
     "- Broad universal prefs → profile_update(). Domain prefs → domain node. Project detail → graph.",
     "- Detect ALL domains in a project before generating. Fire domain queries in parallel.",
     "",
+    "### FILESYSTEM GATE RULE (critical — never skip this):",
+    "  When a named project is mentioned, ALWAYS check memory FIRST.",
+    "  WAIT for memory to return before touching the filesystem AT ALL.",
+    "  The memory result determines whether a filesystem search is even needed.",
+    "",
+    "  FLOW:",
+    "    Step 1: query(summary='<project name>') — WAIT for result.",
+    "    Step 2a: Memory has location → go directly there. No directory listing needed.",
+    "    Step 2b: Memory has NO location → NOW you may search the filesystem.",
+    "",
+    "  DO NOT parallelize a filesystem search with a memory query for project location.",
+    "  A directory listing of a busy workspace can cost hundreds of tokens.",
+    "  Memory costs ~19ms and ~50 tokens. Always let it answer first.",
+    "",
+    "  WRONG (never do this):",
+    "    [memory query] + [list_files workspace/]  ← fires simultaneously, wastes tokens",
+    "",
+    "  RIGHT:",
+    "    [memory query] → result has path → read_file that path directly",
+    "    [memory query] → result empty  → THEN search filesystem",
+    "",
     "═══ USER PROFILE ═══",
     "These are your broad, universal preferences about this user. They apply to EVERY project.",
     "Read this before every response. Update via profile_update() when new broad prefs are learned.",
@@ -480,7 +503,7 @@ Examples:
     args = parser.parse_args()
 
     print("\n╔══════════════════════════════════════════════╗")
-    print("║   cyber_memory installer  v6.2.0            ║")
+    print("   cyber_memory installer  v6.2.1            ")
     print("╚══════════════════════════════════════════════╝\n")
 
     # 1. Locate Code Puppy
